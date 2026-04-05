@@ -1,3 +1,31 @@
+//! # Rusty-Chat
+//!
+//! Async multi-room TCP chat server built with Tokio.
+//!
+//! ## Architecture
+//!
+//! The server revolves around two shared data structures:
+//!
+//! - [`RoomMap`] — maps room names to their [`Room`] (each room has its own broadcast channel)
+//! - [`UserMap`] — maps nick-names to the room they are currently in
+//!
+//! Each connected client runs in its own Tokio task via [`handle_client`].
+//! Messages are routed through per-room [`broadcast`] channels,
+//! ensuring that messages never leak across rooms.
+//!
+//! ## Available commands
+//!
+//! | Command | Description |
+//! |---------|-------------|
+//! | `/join <room>` | Join or create a room |
+//! | `/leave` | Return to `#general` |
+//! | `/msg <nick> <text>` | Send a private message (supports nicks with spaces) |
+//! | `/nick <new_nick>` | Change your nick-name |
+//! | `/list users` | List users in the current room |
+//! | `/list rooms` | List all existing rooms |
+//! | `/help` | Show available commands |
+//! | `/quit` | Disconnect |
+
 use colored::Colorize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -5,6 +33,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{RwLock, broadcast};
 
+/// A chat message routed through the broadcast channels.
+///
+/// # Fields
+///
+/// - `sender` — display name shown to recipients (e.g. `"Alice"` or `"System"`)
+/// - `origin` — nick-name of the user who triggered the message; used to prevent
+///   echoing messages back to their author, even for system messages
+///   (e.g. `"Alice joined #general"` has `origin: "Alice"` so Alice doesn't see it)
+/// - `target` — if `Some(nick)`, the message is private and only delivered to that user;
+///   if `None`, the message is public and delivered to all room members
+/// - `content` — the message body
 #[derive(Clone)]
 pub struct ChatMessage {
     pub sender: String,
@@ -13,16 +52,71 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// A chat room with its own isolated broadcast channel.
+///
+/// Each room maintains a [`broadcast::Sender`] so that messages sent in one room
+/// are never visible to users in other rooms.
+/// Rooms persist even when empty — they are created on first `/join` and
+/// never deleted.
 pub struct Room {
     pub tx: broadcast::Sender<ChatMessage>,
 }
 
-// room_name -> Room
+/// Shared map of all existing rooms.
+///
+/// Key: room name (e.g. `"#general"`, `"#rust"`)
+/// Value: [`Room`] holding the broadcast channel for that room
+///
+/// Wrapped in `Arc<RwLock<_>>` for safe concurrent access across Tokio tasks.
 pub type RoomMap = Arc<RwLock<HashMap<String, Room>>>;
 
-// nick-name -> current room_name
+/// Shared map of all connected users and their current room.
+///
+/// Key: nick-name (e.g. `"Alice"`)
+/// Value: name of the room the user is currently in (e.g. `"#general"`)
+///
+/// Wrapped in `Arc<RwLock<_>>` for safe concurrent access across Tokio tasks.
+/// Used by `/msg` to route private messages across rooms.
 pub type UserMap = Arc<RwLock<HashMap<String, String>>>;
 
+/// Handles a single connected client for its entire session.
+///
+/// This function is spawned as a Tokio task for each accepted TCP connection.
+/// It drives the full client lifecycle:
+///
+/// 1. Prompts for a nick-name
+/// 2. Inserts the user into [`UserMap`] and joins `#general` automatically
+/// 3. Subscribes to the room's broadcast channel
+/// 4. Enters the main `select!` loop, concurrently:
+///    - Reading lines from the client and dispatching commands
+///    - Receiving broadcast messages and forwarding them to the client
+/// 5. On exit (`/quit` or disconnection), removes the user from [`UserMap`]
+///    and broadcasts a leave message
+///
+/// # Arguments
+///
+/// - `socket` — the accepted [`TcpStream`] for this client
+/// - `rooms` — shared [`RoomMap`] for all rooms
+/// - `users` — shared [`UserMap`] tracking which room each user is in
+/// - `ip_addr` — client IP address, used for server-side logging
+///
+/// # Errors
+///
+/// Returns an error if any I/O operation on the socket fails unexpectedly.
+///
+/// # Command parsing
+///
+/// Commands are matched in order with `starts_with`. The `/msg` command
+/// supports nick-names containing spaces by searching [`UserMap`] for the
+/// longest matching prefix in the input.
+///
+/// # Broadcast filtering
+///
+/// A received [`ChatMessage`] is forwarded to the client only if **both**
+/// conditions are met:
+/// - `msg.origin != username` — the client did not trigger this message
+/// - `msg.target.is_none() || msg.target == Some(username)` — the message is
+///   public or explicitly addressed to this client
 pub async fn handle_client(
     socket: TcpStream,
     rooms: RoomMap,
@@ -332,6 +426,20 @@ pub async fn handle_client(
     Ok(())
 }
 
+/// Broadcasts a [`ChatMessage`] to all subscribers of a given room.
+///
+/// Acquires a read lock on [`RoomMap`], looks up the room by name,
+/// and sends the message through its [`broadcast::Sender`].
+/// If the room does not exist, the message is silently dropped.
+///
+/// Errors from [`broadcast::Sender::send`] (e.g. no active receivers)
+/// are intentionally ignored — it is normal for a room to have no listeners.
+///
+/// # Arguments
+///
+/// - `rooms` — shared [`RoomMap`]
+/// - `room_name` — name of the target room
+/// - `msg` — the message to broadcast
 async fn broadcast_to_room(rooms: &RoomMap, room_name: &str, msg: ChatMessage) {
     let map = rooms.read().await;
     if let Some(room) = map.get(room_name) {
