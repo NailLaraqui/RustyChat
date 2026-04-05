@@ -3,6 +3,18 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{Duration, timeout};
 
+/// Starts an isolated server instance bound on a random available port.
+///
+/// Creates a fresh [`RoomMap`] with `#general` and an empty [`UserMap`],
+/// then spawns a Tokio task that accepts connections in a loop.
+///
+/// Using port `0` lets the OS assign a free port, which prevents conflicts
+/// when multiple tests run in parallel.
+///
+/// # Returns
+///
+/// The bound address as a `String` (e.g. `"127.0.0.1:54321"`),
+/// ready to be passed to [`connect_as`].
 async fn start_server() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -31,6 +43,22 @@ async fn start_server() -> String {
     addr
 }
 
+/// Connects a client to the server, completes the handshake, and returns
+/// the split reader/writer pair ready for use in tests.
+///
+/// The handshake sequence is:
+/// 1. Read `"Welcome to Rusty-Chat !\n"`
+/// 2. Read `"Choose a nick-name : \n"`
+/// 3. Send `username`
+/// 4. Read `"You are now in #general\n"` (the join confirmation)
+///
+/// A 50ms sleep is added after the handshake to give the server time to
+/// process the join and broadcast it to other connected clients before
+/// the test starts asserting.
+///
+/// # Returns
+///
+/// A `(BufReader<OwnedReadHalf>, OwnedWriteHalf)` pair for the connection.
 async fn connect_as(addr: &str, username: &str) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
     let stream = TcpStream::connect(addr).await.unwrap();
     let (reader, mut writer) = stream.into_split();
@@ -55,6 +83,11 @@ async fn connect_as(addr: &str, username: &str) -> (BufReader<OwnedReadHalf>, Ow
     (reader, writer)
 }
 
+/// Reads one line from the client with a 300ms timeout.
+///
+/// Returns `None` if the timeout expires, if the connection is closed,
+/// or if an I/O error occurs. This avoids blocking tests indefinitely
+/// when no message is expected.
 async fn read_line_timeout(reader: &mut BufReader<OwnedReadHalf>) -> Option<String> {
     let mut buf = String::new();
     timeout(Duration::from_millis(300), reader.read_line(&mut buf))
@@ -64,6 +97,21 @@ async fn read_line_timeout(reader: &mut BufReader<OwnedReadHalf>) -> Option<Stri
     if buf.is_empty() { None } else { Some(buf) }
 }
 
+/// Reads lines from the client until one satisfies `predicate`, up to `attempts` tries.
+///
+/// Each attempt calls [`read_line_timeout`] and discards lines that do not match.
+/// Returns the first matching line, or `None` if no match is found within `attempts`.
+///
+/// This is the primary assertion helper for tests involving async message delivery,
+/// where system messages (join/leave notifications) may arrive before the expected one.
+///
+/// # Example
+///
+/// ```rust
+/// // Wait for Bob's join notification, ignoring any prior system messages
+/// let line = read_until(&mut r1, |l| l.contains("Bob") && l.contains("joined"), 5).await;
+/// assert!(line.is_some());
+/// ```
 async fn read_until<F>(
     reader: &mut BufReader<OwnedReadHalf>,
     predicate: F,
@@ -82,6 +130,12 @@ where
     None
 }
 
+/// Discards incoming lines from the client, up to `attempts` tries.
+///
+/// Stops early if [`read_line_timeout`] returns `None` (no more messages available).
+/// Used to flush pending system messages (join/leave notifications) before
+/// making assertions, so that leftover messages from a previous step do not
+/// interfere with the next `read_until` call.
 async fn drain(reader: &mut BufReader<OwnedReadHalf>, attempts: usize) {
     for _ in 0..attempts {
         if read_line_timeout(reader).await.is_none() {
